@@ -6,11 +6,17 @@ Architecture: Sequential orchestrator -> Schema Fetcher -> SQL Recovery Loop -> 
 # NEW
 import os
 import json
+import tempfile
 from google.adk.agents import Agent, SequentialAgent, LoopAgent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from google.cloud import bigquery
+
+if creds_json := os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON"):
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        f.write(creds_json)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = f.name
 
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "true")
 

@@ -1,192 +1,173 @@
 """
-QueryMind Agents
-Architecture: Sequential orchestrator → SQL Generator → Recovery Loop → Narrator + Chart
+QueryMind Agents - v2 (direct BigQuery tools, no MCP stdio issues)
+Architecture: Sequential orchestrator -> Schema Fetcher -> SQL Recovery Loop -> Narrator
 """
 
+# NEW
 import os
 import json
 from google.adk.agents import Agent, SequentialAgent, LoopAgent
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioServerParameters
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from google.cloud import bigquery
+
+os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "true")
 
 MODEL = "gemini-2.5-flash"
-MCP_SERVER_PATH = os.path.join(os.path.dirname(__file__), "mcp_server.py")
+APP_NAME = "querymind"
+
+bq_client = bigquery.Client()
+
+BLOCKED_KEYWORDS = ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER", "TRUNCATE", "MERGE"]
 
 
-# ── MCP Toolset ──────────────────────────────────────────────────────────────
+def get_dataset_schema() -> dict:
+    """Return available tables and columns in the Medicare dataset."""
+    try:
+        tables = list(bq_client.list_tables("bigquery-public-data.cms_medicare"))
+        result = {}
+        for table in tables[:8]:
+            ref = bq_client.get_table(table)
+            result[table.table_id] = [
+                {"name": f.name, "type": f.field_type}
+                for f in ref.schema
+            ]
+        return {"tables": result}
+    except Exception as e:
+        return {"error": str(e), "tables": {}}
 
-def get_mcp_toolset():
-    return MCPToolset(
-        connection_params=StdioServerParameters(
-            command="python",
-            args=[MCP_SERVER_PATH],
-        )
-    )
 
+def run_bigquery_sql(sql: str) -> dict:
+    """Execute a read-only BigQuery SQL query. Returns rows or an error string."""
+    sql_upper = sql.upper()
+    for kw in BLOCKED_KEYWORDS:
+        if kw in sql_upper:
+            return {"error": f"Blocked: '{kw}' not permitted. Only SELECT allowed.", "rows": [], "row_count": 0}
+    try:
+        job_config = bigquery.QueryJobConfig(maximum_bytes_billed=100 * 1024 * 1024)
+        query_job = bq_client.query(sql, job_config=job_config)
+        results = query_job.result(timeout=30)
+        rows = [dict(row) for row in results][:200]
+        return {
+            "error": None,
+            "rows": rows,
+            "row_count": len(rows),
+            "schema": [{"name": f.name, "type": f.field_type} for f in results.schema],
+        }
+    except Exception as e:
+        return {"error": str(e), "rows": [], "row_count": 0}
 
-# ── Agent 1: Schema Fetcher ───────────────────────────────────────────────────
 
 schema_fetcher = Agent(
     name="schema_fetcher",
     model=MODEL,
-    description="Fetches the BigQuery dataset schema so other agents know what tables and columns exist.",
+    description="Fetches BigQuery dataset schema.",
     instruction="""
 You are a schema discovery agent.
-
-Call get_dataset_schema() to retrieve available tables and columns.
-Output a concise schema summary in this format:
+Call get_dataset_schema() and output:
 
 SCHEMA:
 - table_name: col1 (TYPE), col2 (TYPE), ...
 
-Do not generate SQL. Just report the schema clearly.
+Do not generate SQL.
 """,
-    tools=[get_mcp_toolset()],
+    tools=[get_dataset_schema],
 )
-
-
-# ── Agent 2: SQL Generator ────────────────────────────────────────────────────
 
 sql_generator = Agent(
     name="sql_generator",
     model=MODEL,
-    description="Translates natural language questions into valid BigQuery SQL using the Medicare dataset.",
+    description="Translates natural language into BigQuery SQL.",
     instruction="""
 You are a SQL generation agent for BigQuery.
 
-You will receive:
+You receive:
 1. A user question
-2. A schema summary from the schema_fetcher
+2. A schema summary
+3. Optionally: a prior error to fix
 
-Your job: write a single, valid BigQuery Standard SQL SELECT query that answers the question.
-
-Rules:
-- Only use tables and columns that appear in the schema summary
-- Always use fully qualified table names: `bigquery-public-data.cms_medicare.<table>`
-- Use LIMIT 100 unless the question asks for aggregation
-- Never use INSERT, UPDATE, DELETE, DROP, or any write operation
-- Output ONLY the SQL — no explanation, no markdown fences
-
-If the previous attempt failed, you will also receive the error message.
-Fix the SQL based on the error before outputting.
+Write ONE valid BigQuery Standard SQL SELECT query.
+- Use fully qualified table names: `bigquery-public-data.cms_medicare.<table>`
+- Use LIMIT 100 unless aggregating
+- Never use INSERT, UPDATE, DELETE, DROP
+- Output ONLY the SQL, no markdown, no explanation
 """,
-    tools=[get_mcp_toolset()],
+    tools=[],
 )
-
-
-# ── Agent 3: Query Executor + Recovery Loop ───────────────────────────────────
 
 executor_agent = Agent(
     name="query_executor",
     model=MODEL,
-    description="Executes SQL against BigQuery and signals success or failure for the retry loop.",
+    description="Executes SQL via BigQuery and signals success or failure.",
     instruction="""
 You are a query execution agent.
 
-1. Take the SQL from the previous agent's output (look for a SELECT statement).
-2. Call run_bigquery_sql(sql=<the_sql>) to execute it.
-3. If the result contains an "error" field that is not null:
-   - Output exactly: EXECUTION_FAILED: <error message>
-   - This signals the loop to retry with the sql_generator.
-4. If successful (error is null):
+1. Find the SELECT statement in the previous output.
+2. Call run_bigquery_sql(sql=<the_sql>).
+3. If result has a non-null error field:
+   - Output: EXECUTION_FAILED: <error>
+4. If successful:
    - Output: EXECUTION_SUCCESS
-   - Then output the raw JSON result rows (first 20 rows max).
-   - Format: RESULT_JSON: <json>
-
-Be precise. The loop agent reads your output to decide whether to continue.
+   - Output: RESULT_JSON: <first 20 rows as JSON>
 """,
-    tools=[get_mcp_toolset()],
+    tools=[run_bigquery_sql],
 )
 
 recovery_loop = LoopAgent(
     name="sql_recovery_loop",
-    description="Retries SQL generation and execution up to 3 times on failure.",
+    description="Retries SQL generation and execution up to 3 times.",
     sub_agents=[sql_generator, executor_agent],
     max_iterations=3,
-    # Loop exits when executor outputs EXECUTION_SUCCESS
-    should_continue_fn=lambda output: "EXECUTION_SUCCESS" not in (output or ""),
 )
-
-
-# ── Agent 4: Narrator ─────────────────────────────────────────────────────────
 
 narrator = Agent(
     name="narrator",
     model=MODEL,
-    description="Converts raw BigQuery results into a plain-English insight summary and a chart specification.",
+    description="Converts query results into insights and chart specs.",
     instruction="""
-You are a data insight narrator and chart designer.
+You are a data insight narrator.
 
-You will receive raw BigQuery result rows (JSON) and the original user question.
+You receive BigQuery result rows and the original user question.
 
-Your output must be valid JSON with this exact structure:
+Output ONLY valid JSON:
 {
-  "summary": "<3-4 sentence plain English insight answering the user's question>",
+  "summary": "<3-4 sentence plain English insight>",
   "chart": {
-    "type": "bar" | "line" | "pie" | "table",
-    "title": "<descriptive chart title>",
-    "x_field": "<column name for x-axis or labels>",
-    "y_field": "<column name for values>",
-    "data": [<first 15 rows from result, as list of dicts>]
+    "type": "bar" or "line" or "pie" or "table",
+    "title": "<title>",
+    "x_field": "<column for x-axis or labels>",
+    "y_field": "<column for values>",
+    "data": [<first 15 rows>]
   },
-  "key_finding": "<one bold headline finding, max 15 words>"
+  "key_finding": "<one headline, max 15 words>"
 }
 
-Choose chart type based on the data:
-- Rankings / comparisons → bar
-- Trends over time → line
-- Proportions → pie (max 8 slices)
-- Many columns → table
-
-Output ONLY the JSON. No prose before or after.
+No prose before or after the JSON.
 """,
 )
 
-
-# ── Orchestrator ──────────────────────────────────────────────────────────────
-
 orchestrator = SequentialAgent(
     name="querymind_orchestrator",
-    description="QueryMind: Natural language data analyst for Medicare public data.",
-    sub_agents=[
-        schema_fetcher,
-        recovery_loop,
-        narrator,
-    ],
+    description="QueryMind: NL data analyst for Medicare public data.",
+    sub_agents=[schema_fetcher, recovery_loop, narrator],
 )
 
-
-# ── Runner ────────────────────────────────────────────────────────────────────
-
 session_service = InMemorySessionService()
-APP_NAME = "querymind"
 
 
-def create_runner():
-    return Runner(
+async def run_query(question: str, session_id: str = "default") -> dict:
+    runner = Runner(
         agent=orchestrator,
         app_name=APP_NAME,
         session_service=session_service,
     )
 
-
-async def run_query(question: str, session_id: str = "default") -> dict:
-    """
-    Run a natural language query through the full agent pipeline.
-    Returns a dict with thinking_log (list of agent steps) and final output.
-    """
-    runner = create_runner()
-
-    try:
-        session_service.create_session(
-            app_name=APP_NAME,
-            user_id="user",
-            session_id=session_id,
-        )
-    except Exception:
-        pass  # session may already exist
+    await session_service.create_session(
+        app_name=APP_NAME,
+        user_id="user",
+        session_id=session_id,
+    )
 
     thinking_log = []
     final_output = None
@@ -203,21 +184,18 @@ async def run_query(question: str, session_id: str = "default") -> dict:
             if event.content and event.content.parts:
                 final_output = event.content.parts[0].text
         else:
-            # Capture intermediate agent thinking
             agent_name = getattr(event, "author", "agent")
             if event.content and event.content.parts:
                 for part in event.content.parts:
                     if hasattr(part, "text") and part.text:
                         thinking_log.append({
                             "agent": agent_name,
-                            "step": part.text[:500],  # truncate for display
+                            "step": part.text[:500],
                         })
 
-    # Try to parse narrator JSON output
     result = {"thinking_log": thinking_log, "raw_output": final_output}
     if final_output:
         try:
-            # Strip markdown fences if present
             clean = final_output.strip().removeprefix("```json").removesuffix("```").strip()
             parsed = json.loads(clean)
             result["summary"] = parsed.get("summary", "")

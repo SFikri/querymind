@@ -82,6 +82,7 @@ with st.sidebar:
     for ex in examples:
         if st.button(ex, key=ex, use_container_width=True):
             st.session_state["prefill"] = ex
+            st.rerun()
 
     st.divider()
     st.caption("Track B · Quantitative Forge · Gemini Nexus Boss Raid 2026")
@@ -92,14 +93,14 @@ st.markdown("## 🔍 QueryMind")
 st.markdown("Ask any question about Medicare public data. The agent swarm writes the SQL, recovers from errors, and explains the results.")
 
 prefill = st.session_state.pop("prefill", "")
-question = st.text_input(
-    "Your question",
-    value=prefill,
-    placeholder="e.g. Which states had the highest average Medicare payment per beneficiary?",
-    label_visibility="collapsed",
-)
-
-run_btn = st.button("Run query →")
+with st.form("query_form", clear_on_submit=False):
+    question = st.text_input(
+        "Your question",
+        value=prefill,
+        placeholder="e.g. Which states had the highest average Medicare payment per beneficiary?",
+        label_visibility="collapsed",
+    )
+    run_btn = st.form_submit_button("Run query →")
 
 # ── Session history ───────────────────────────────────────────────────────────
 

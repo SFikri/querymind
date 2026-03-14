@@ -4,7 +4,7 @@
 > *"What if anyone could interrogate a 50M-row healthcare dataset just by asking a question?"*
 
 **Track B — Quantitative Forge · Gemini Nexus: The Agentverse Boss Raid 2026**
-Built by: Fikri | GDG UTM + GDG George Town
+Built by: Syed Fikri Syaddad for Gemini Nexus The Agentverse and 
 
 ---
 

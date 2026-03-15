@@ -88,7 +88,7 @@ The system handles errors autonomously: if the SQL fails, the recovery loop retr
 | Data | BigQuery — `bigquery-public-data.cms_medicare` |
 | Safety | ADK input guardrails — blocks INSERT/UPDATE/DELETE/DROP |
 | Frontend | Streamlit + Plotly |
-| Deployment | Streamlit Cloud |
+| Deployment | Streamlit Cloud | **Live demo:** https://querymind-dataanalystagentinhealthcare.streamlit.app/
 
 **Sessions covered:** S3 (MCP), S4 (ADK guardrails), S6 (ADK + BigQuery), S8 (multi-agent patterns — Sequential, Loop)
 
